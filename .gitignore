@@ -1,0 +1,21 @@
+# Build output
+x64/
+Debug/
+Release/
+*.obj
+*.pdb
+*.exe
+*.ilk
+*.log
+*.tlog
+*.idb
+*.ipch
+*.pch
+*.sdf
+*.opensdf
+*.suo
+*.user
+
+# VS directories
+.vs/
+ipch/
