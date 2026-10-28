@@ -247,6 +247,18 @@ x64 only. PEB via `gs:[0x60]`, 64-bit optional header layout, x64 stub encoding.
 
 ---
 
+## References and Further Reading
+
+- Microsoft, [PE Format — The TLS Section](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-tls-section). TLS directory fields and callback conventions.
+- Microsoft, [CRT initialization](https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-initialization). Runtime initialization and the distinction between the executable entry point and application code.
+- Microsoft, [DllMain entry point](https://learn.microsoft.com/en-us/windows/win32/dlls/dllmain) and [Dynamic-Link Library Best Practices](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-best-practices). DLL initialization constraints and attachment return semantics.
+- Galen Hunt and Doug Brubacher, [Detours: Binary Interception of Win32 Functions](https://www.microsoft.com/en-us/research/publication/detours-binary-interception-of-win32-functions/), 1999. General binary-interception background.
+- MDSec, [Bypassing User-Mode Hooks and Direct Invocation of System Calls for Red Teams](https://www.mdsec.co.uk/2020/12/bypassing-user-mode-hooks-and-direct-invocation-of-system-calls-for-red-teams/), December 2020. Invocation-path and hook context.
+- Marcus Hutchins, [Bypassing EDRs With EDR-Preloading](https://malwaretech.com/2024/02/bypassing-edrs-with-edr-preloading.html), 13 February 2024. Prior startup-oriented research.
+- Guido Miggelenbrink, [Introducing Early Cascade Injection: From Windows Process Creation to Stealthy Injection](https://www.yourinsectpartner.com/post/introducing-early-cascade-injection-from-windows-process-creation-to-stealthy-injection), 15 October 2024. Additional process-initialization context.
+
+---
+
 ## Author
 
 Daniel Feichter ([@VirtualAlllocEx](https://github.com/VirtualAlllocEx)) — [RedOps](https://redops.at)
