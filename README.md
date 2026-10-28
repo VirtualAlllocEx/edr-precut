@@ -184,9 +184,52 @@ int main(void)
 
 ---
 
-## Placeholder DLL Names
+## Configuring Target DLLs
 
-Every target in this repository is a non-functional placeholder — `edr_hook`, `edr_dev`, `edrclient64.dll`, `edrclient.dll`. They match nothing on a live system. Replace them with the actual basenames of the hooking DLLs from your target EDR before building. The blog post covers identification via kernel debugger, `lm` output, and breakpoints on `ntdll!LdrLoadDll`.
+Every target in this repository is a non-functional placeholder — `edr_hook`, `edr_dev`, `edrclient64.dll`, `edrclient.dll`. They match nothing on a live system. Before building for a lab environment, replace them with the actual basenames of the hooking DLLs injected by your target EDR. The blog post covers how to identify the correct names using a kernel debugger, `lm` output, and breakpoints on `ntdll!LdrLoadDll`.
+
+### PREFIX vs EXACT — when to use which
+
+EDR vendors name their injected DLLs in one of two patterns:
+
+**Versioned names** — the basename includes a build number, hash, or version string that changes with each agent update. Only the leading portion stays constant across versions. Use `PRECUT_PREFIX` and give it just the stable part:
+
+```c
+/* Matches hookengine.dll, hookengine8542.dll, hookengine_v3.dll, etc. */
+PRECUT_PREFIX(L"hookengine")
+```
+
+**Fixed names** — the full filename never changes across versions. Use `PRECUT_EXACT` with the complete basename:
+
+```c
+/* Matches only agentclient64.dll, nothing else */
+PRECUT_EXACT(L"agentclient64.dll")
+```
+
+Can you always use `PRECUT_PREFIX` instead of `PRECUT_EXACT`? Technically yes — `PRECUT_PREFIX(L"agentclient64")` will match `agentclient64.dll`. But it would also match `agentclient64patch.dll` or `agentclient64v2.dll` if those ever appeared. Stubbing the wrong module can crash the process. `PRECUT_EXACT` rules out that ambiguity.
+
+Rule of thumb: if the DLL name has a changing suffix (build numbers, hashes), use `PRECUT_PREFIX` with the stable leading part. If the name is always identical, use `PRECUT_EXACT`. When in doubt, `PRECUT_PREFIX` with a specific-enough prefix works for most cases — generic prefixes like `agent` or `hook` risk collateral matches; vendor-specific prefixes rarely collide with anything else.
+
+### Putting it together
+
+A single-vendor target list might look like this:
+
+```c
+#define PRECUT_TARGETS                          \
+    PRECUT_PREFIX(L"edr_hook")                 \
+    PRECUT_PREFIX(L"edr_dev")
+```
+
+A multi-vendor list combining both match types:
+
+```c
+#define PRECUT_TARGETS                          \
+    PRECUT_PREFIX(L"vendorA_hook")             \
+    PRECUT_PREFIX(L"vendorA_dev")              \
+    PRECUT_EXACT(L"vendorBclient64.dll")
+```
+
+Add one line per DLL the EDR injects. Remove lines you don't need. There is no fixed number of entries — match what you see in `lm` output on your lab VM.
 
 ---
 
