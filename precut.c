@@ -10,7 +10,7 @@
  *   3. We register LdrRegisterDllNotification (Write B)
  *   4. NtTestAlert drains APC → EDR DLLs get mapped
  *   5. Our notification fires BEFORE each DllMain
- *   6. We overwrite AddressOfEntryPoint with: mov eax,1; ret (B8 01 C3)
+ *   6. We overwrite AddressOfEntryPoint with: mov eax,1; ret
  *   7. Loader calls the stub → returns TRUE → real DllMain never runs
  *
  * Placeholder DLL names below match nothing. Edit is_hooking_dll():

@@ -25,7 +25,7 @@
  * ---
  *   precut_arm()           PEB walk (Write A) + register notification (Write B).
  *   precut_disarm()        Unregister notification. Reduces forensic surface.
- *   precut_set_callback(fn)  void fn(wchar_t *name, void *base, int ok)
+ *   precut_set_callback(fn)  void fn(const wchar_t *name, void *base, int ok)
  *   precut_stub_count()    Entry points stubbed so far.
  *
  * TARGET MACROS
