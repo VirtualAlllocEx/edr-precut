@@ -11,7 +11,9 @@
  *   // In exactly ONE .c file:
  *   #define PRECUT_IMPLEMENTATION
  *
- *   // Define your targets (replace with real module names):
+ *   // Define your targets (replace placeholders with real module names):
+ *   //   PREFIX → versioned DLLs (suffix changes per agent update)
+ *   //   EXACT  → fixed-name DLLs (same filename across versions)
  *   #define PRECUT_TARGETS             \
  *       PRECUT_PREFIX(L"edr_hook")     \
  *       PRECUT_PREFIX(L"edr_dev")      \
@@ -43,9 +45,20 @@
  *
  * TARGET MACROS
  * -------------
- *   PRECUT_PREFIX(L"prefix")   Case-insensitive prefix + .dll suffix.
- *                              Matches "prefixNNNNN.dll" etc.
- *   PRECUT_EXACT(L"name.dll")  Case-insensitive exact basename match.
+ *   PRECUT_PREFIX(L"prefix")   Use for versioned DLLs whose basename
+ *                              includes a build number or hash that
+ *                              changes across agent updates. Give only
+ *                              the stable leading part. Case-insensitive
+ *                              prefix match with .dll suffix guard.
+ *                              "hookeng8542.dll" matches PREFIX(L"hookeng").
+ *
+ *   PRECUT_EXACT(L"name.dll")  Use for fixed-name DLLs that never change
+ *                              across versions. Case-insensitive exact
+ *                              basename match — zero ambiguity.
+ *
+ *   PREFIX works for both cases if the prefix is specific enough to never
+ *   collide with unrelated modules. EXACT rules out accidental matches on
+ *   generic prefixes. Stubbing the wrong module crashes the process.
  *
  * COMPILE-TIME OPTIONS
  * --------------------
@@ -111,7 +124,14 @@ PRECUT_API int  precut_stub_count(void);
 
 #include <winternl.h>
 
-/* ---- Default target list (placeholders) ------------------------------ */
+/* ---- Default target list (placeholders — match nothing on a live system)
+ *
+ * Replace with real DLL names from your lab:
+ *   PRECUT_PREFIX  → versioned DLLs (build number/hash changes per update)
+ *   PRECUT_EXACT   → fixed-name DLLs (same filename across all versions)
+ *
+ * Add or remove entries to match what your target EDR injects.
+ * --------------------------------------------------------------------- */
 
 #ifndef PRECUT_TARGETS
 #define PRECUT_TARGETS                         \
