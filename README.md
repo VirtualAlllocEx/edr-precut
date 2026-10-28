@@ -1,12 +1,31 @@
 # Precut
 
-Stub EDR user-mode hooking DLLs before they initialize — from inside the PE loader's own TLS window.
+[![Platform](https://img.shields.io/badge/Platform-Windows%20x64-blue.svg)](#build-requirements) [![Language](https://img.shields.io/badge/Language-C-brightgreen.svg)](precut.c) [![Toolchain](https://img.shields.io/badge/Toolchain-MSVC%20v143-555555.svg)](#build-requirements) [![Research](https://img.shields.io/badge/Type-Security%20Research-red.svg)](#scope-and-limitations)
 
-Companion code for [EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization).
+A Windows x64 proof of concept for studying the timing between PE TLS callbacks and EDR user-mode hook initialization.
 
----
+> **📖 Complete Technical Write-Up**
+>
+> For the loader analysis, debugger walkthrough, and research context, read the companion blog post:
+>
+> **[EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization)**
 
-## The Technique
+Results depend on the initialization order being studied. Read [Scope and Limitations](#scope-and-limitations) alongside the technical description.
+
+## Contents
+
+- [Overview](#overview)
+- [Repository Layout](#repository-layout)
+- [Build Requirements](#build-requirements)
+- [Quick Start](#quick-start)
+- [Header Library](#header-library)
+- [Placeholder DLL Names](#placeholder-dll-names)
+- [Verification](#verification)
+- [Scope and Limitations](#scope-and-limitations)
+- [Disclaimer](#disclaimer)
+- [Author](#author)
+
+## Overview
 
 When Windows creates a process, `ntdll!LdrpInitializeProcess` walks the PE's TLS directory and fires any registered callbacks early — before the CRT, before `main`, and before `NtTestAlert`. That last point matters. `NtTestAlert` drains the thread's APC queue, and an EDR kernel driver that wants to inject a hooking engine typically queues that injection as an APC from an image-load or process-creation callback. Until the loader reaches `NtTestAlert`, the APC sits undelivered. The hooking DLL does not exist in the process yet.
 
@@ -49,15 +68,44 @@ examples/
   loader_integration.c           Loader template with callback + stub gating
 ```
 
-**`precut.c`** is the self-contained proof-of-concept the blog post walks through. Start here if you are reading the analysis or studying the technique for the first time.
+**[precut.c](precut.c)** is the self-contained proof of concept discussed in the blog. Start here when following the analysis.
 
 **`precut.h`** packages the same mechanism as a drop-in single-header library. Define your targets, include the header, call `precut_arm()`. It adds a callback interface, an atomic stub counter, and `precut_disarm()` for cleanup.
 
-**`examples/`** holds two integration templates — one for standalone binaries, one for loaders that already have their own TLS callback.
+**[examples/](examples/)** holds two integration templates: [standalone.c](examples/standalone.c) and [loader_integration.c](examples/loader_integration.c).
+
+The supplied [Visual Studio solution](PrecutCore.sln) and [project](PrecutCore.vcxproj) build `precut.c`. The examples are separate templates.
+
+---
+
+## Build Requirements
+
+The supplied project targets **Visual Studio 2022**, the **v143 platform toolset**, and **x64**. Release uses `/MT` and Debug uses `/MTd` (static CRT), so a separate MSVC runtime DLL is not required. This does not remove dependencies on Windows system DLLs.
+
+Other toolchains are not covered by this repository's build configuration.
+
+<details>
+<summary><strong>MSVC TLS registration details</strong></summary>
+
+The TLS callback registration uses four pieces of compiler and linker machinery:
+
+1. **`#pragma section(".CRT$XLB", long, read)`** places the callback pointer into the CRT's TLS callback array. The linker merges `.CRT$XLA` through `.CRT$XLZ` alphabetically.
+
+2. **`__declspec(allocate(".CRT$XLB"))`** pins the pointer to that section.
+
+3. **`__declspec(thread)`** on the sentinel variable keeps the TLS directory alive. Without it, the linker may optimize away the entire TLS apparatus — the callback pointer exists in the binary but the loader never sees it.
+
+4. **`/INCLUDE:_tls_used`** forces emission of the `IMAGE_TLS_DIRECTORY64` structure. This is what makes `dumpbin /tls` report the callback address.
+
+</details>
 
 ---
 
 ## Quick Start
+
+See [Build Requirements](#build-requirements) for the supported toolchain and [Placeholder DLL Names](#placeholder-dll-names) for the scope of the example configuration.
+
+### Build the standalone PoC
 
 Open `PrecutCore.sln` in Visual Studio 2022 and build `Release|x64`, or from a Developer Command Prompt:
 
@@ -65,7 +113,9 @@ Open `PrecutCore.sln` in Visual Studio 2022 and build `Release|x64`, or from a D
 msbuild PrecutCore.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-Confirm the TLS directory made it into the binary:
+### Check the TLS directory
+
+Confirm the TLS directory is present in the output binary:
 
 ```
 dumpbin /tls x64\Release\PrecutCore.exe
@@ -75,7 +125,9 @@ You should see a TLS directory entry with a non-zero callback address. If the se
 
 ---
 
-## Header Library — precut.h
+## Header Library
+
+The single-header version is provided in [precut.h](precut.h).
 
 In exactly one `.c` file, define `PRECUT_IMPLEMENTATION`, set your target list, and include the header:
 
@@ -95,14 +147,14 @@ For standalone binaries, add `#define PRECUT_TLS_AUTO` before the include — th
 ### Target Macros
 
 | Macro | Behavior |
-|---|---|
+| --- | --- |
 | `PRECUT_PREFIX(L"name")` | Case-insensitive prefix match with `.dll` suffix guard. Catches versioned names like `name12345.dll` without matching `name.cfg`. |
 | `PRECUT_EXACT(L"name.dll")` | Case-insensitive exact basename comparison. |
 
 ### API
 
 | Function | Description |
-|---|---|
+| --- | --- |
 | `precut_arm()` | Walk PEB for already-mapped targets (Write A), then register `LdrRegisterDllNotification` (Write B). Call from a TLS callback or any point before `NtTestAlert`. |
 | `precut_disarm()` | Unregister the notification via `LdrUnregisterDllNotification`. Reduces forensic surface — the callback list in ntdll is walkable. |
 | `precut_set_callback(fn)` | Register `void fn(const wchar_t *name, void *base, int ok)` — fires after each stub attempt. Use it to log hits or gate execution on a minimum count. |
@@ -111,7 +163,7 @@ For standalone binaries, add `#define PRECUT_TLS_AUTO` before the include — th
 ### Compile-Time Options
 
 | Define | Effect |
-|---|---|
+| --- | --- |
 | `PRECUT_IMPLEMENTATION` | Include the implementation. Set this in exactly one translation unit. |
 | `PRECUT_TLS_AUTO` | Emit MSVC TLS plumbing so `precut_arm()` runs at process attach. Implies `PRECUT_STATIC`. |
 | `PRECUT_STATIC` | Make all API functions `static`. |
@@ -124,27 +176,11 @@ Every target list in this repository ships with non-functional placeholders — 
 
 ---
 
-## Build Requirements
-
-MSVC only. The TLS callback registration depends on four pieces of MSVC-specific compiler and linker machinery:
-
-1. **`#pragma section(".CRT$XLB", long, read)`** places the callback pointer into the CRT's TLS callback array. The linker merges `.CRT$XLA` through `.CRT$XLZ` alphabetically. MinGW's linker does not guarantee the same merge behavior.
-
-2. **`__declspec(allocate(".CRT$XLB"))`** pins the pointer to that section. No GCC equivalent produces the same PE layout.
-
-3. **`__declspec(thread)`** on the sentinel variable keeps the TLS directory alive. Without it, the linker may optimize away the entire TLS apparatus — the callback pointer exists in the binary but the loader never sees it.
-
-4. **`/INCLUDE:_tls_used`** forces emission of the `IMAGE_TLS_DIRECTORY64` structure. This is what makes `dumpbin /tls` report the callback address.
-
-Visual Studio 2022, v143 platform toolset, x64. The project uses `/MT` (static CRT) so the output has no runtime DLL dependencies.
-
----
-
 ## Verification
 
 Run the binary on a lab VM with the target EDR active. Attach WinDbg before launch, or use `ntsd -G -g PrecutCore.exe`.
 
-**1. Confirm the TLS callback ran before the APC:**
+### 1. Confirm the TLS callback ran before the APC
 
 ```
 bp ntdll!NtTestAlert
@@ -153,7 +189,7 @@ g
 
 At the breakpoint, the TLS callback has already fired and the notification is registered, but the EDR DLLs have not been mapped yet.
 
-**2. Continue and inspect the target modules:**
+### 2. Continue and inspect the target modules
 
 ```
 g
@@ -164,7 +200,7 @@ lm m edr_*
 
 The modules appear as mapped, but their entry points contain `B8 01 00 00 00 C3` instead of the real `DllMain` prologue.
 
-**3. Verify syscall stubs are clean:**
+### 3. Inspect the syscall stub
 
 ```
 db ntdll!NtProtectVirtualMemory L6
@@ -175,6 +211,8 @@ A clean stub reads `4C 8B D1 B8 xx xx` — the `mov r10, rcx` / `mov eax, <sysca
 ---
 
 ## Scope and Limitations
+
+These observations concern selected user-mode initialization routines. They do not establish that all EDR monitoring or kernel telemetry has stopped.
 
 Precut targets one specific initialization order: EDR products that deliver their user-mode engine via a kernel APC that drains at `NtTestAlert`, after EXE TLS callbacks have already executed. This is a common pattern, but not the only one.
 
