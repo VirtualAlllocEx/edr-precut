@@ -1,6 +1,6 @@
 # Precut
 
-Precut is a minimal proof-of-concept that demonstrates a timing window in the Windows PE loader — one that exists between the execution of an EXE's TLS callbacks and the moment `NtTestAlert` drains the kernel-queued APCs that deliver EDR user-mode hooking DLLs into the process. Inside that window, the hooking modules have not been mapped yet. Precut registers a DLL load notification from within the TLS callback, then uses it to overwrite each hooking DLL's entry point before the loader ever calls `DllMain`. The hooks are never planted. The syscall stubs in `ntdll` and `KERNELBASE` stay clean.
+Precut is a minimal proof-of-concept that demonstrates a timing window in the Windows PE loader. The window sits between the execution of an EXE's TLS callbacks and the moment `NtTestAlert` drains the kernel-queued APCs that deliver EDR user-mode hooking DLLs into the process. Inside it, the hooking modules have not been mapped yet. Precut registers a DLL load notification from within the TLS callback, then uses that notification to overwrite each hooking DLL's entry point before the loader ever calls `DllMain`. The hooks are never planted. The syscall stubs in `ntdll` and `KERNELBASE` stay clean.
 
 This repository is the companion code for the blog post [EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization), which walks through the full analysis — from kernel callback to user-mode hook installation — and explains how the window was found, why it exists, and what its boundaries are.
 
@@ -45,7 +45,7 @@ Before you build this for a lab environment, you need to replace these entries w
 
 ## Build
 
-Precut must be compiled with MSVC. The TLS callback registration depends on compiler-specific machinery that GCC and MinGW do not support in a reliable way:
+Precut must be compiled with MSVC. The TLS callback registration depends on MSVC-specific compiler machinery that GCC and MinGW cannot reliably reproduce:
 
 - `#pragma section(".CRT$XLB", long, read)` places the callback pointer into the CRT's TLS callback collection section. The linker merges `.CRT$XLA` through `.CRT$XLZ` in alphabetical order to build the callback array that the loader walks. This is an MSVC/link.exe convention — MinGW's linker handles `.CRT$` sections differently and does not guarantee the same merge behavior.
 - `__declspec(allocate(".CRT$XLB"))` assigns the callback pointer to that specific section. No GCC equivalent produces the same PE layout.
@@ -80,6 +80,8 @@ Attach WinDbg to the process before launch (or use `ntsd -G -g PrecutCore.exe`).
 lm m edr_*
 ```
 
+(Replace `edr_*` with the actual module name pattern from your target EDR.)
+
 The modules will appear as mapped (they have a base address and image size) but their entry points contain `B8 01 00 00 00 C3` instead of the real `DllMain` prologue. To verify that the syscall stubs were not hooked, read six bytes from a known hook target:
 
 ```
@@ -94,9 +96,15 @@ Precut targets one specific initialization order: EDR products that deliver thei
 
 EDR products that map their hooking DLL synchronously from a kernel image-load callback — completing the map before control returns to user-mode loader code — will have their module present in the PEB loader list before TLS runs. The PEB walk (Write A) is a partial defense against this, but if the EDR's `DllMain` also runs synchronously during that kernel callback's completion, the hooks are already installed before Precut gets a chance to act. The blog post discusses this distinction in detail and shows how to determine which path a given product uses.
 
+The undocumented loader structures and notification API used here have been stable across Windows 10 and Windows 11 (tested through 10.0.26100). Older versions (Windows 7/8) expose the same `LdrRegisterDllNotification` export but have not been verified.
+
 The code is x64 only. The PEB is read via `gs:[0x60]`, the `IMAGE_NT_HEADERS` layout assumes the 64-bit optional header, and the six-byte stub (`mov eax, 1` / `ret`) is an x64 instruction sequence. A 32-bit port would need different register-width assumptions and a `fs:[0x30]` PEB read.
 
-This is a research and teaching tool for understanding EDR initialization order on Windows. It is not an evasion framework and is not intended for production use or unauthorized testing.
+Precut exists to teach EDR initialization order on Windows — not as an evasion framework, and not for production use or unauthorized testing.
+
+## Disclaimer
+
+This code is published for educational purposes and authorized security research only. It is intended to help defenders and researchers understand EDR initialization order on Windows. Do not use it against systems you do not own or do not have explicit written permission to test. The author assumes no liability for misuse.
 
 ## Author
 

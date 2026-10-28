@@ -7,12 +7,21 @@ Release/
 *.exe
 *.ilk
 *.log
+*.tlog/
 *.tlog
 *.idb
+*.lastbuildstate
+
+# IntelliSense and browse databases
 *.ipch
 *.pch
 *.sdf
 *.opensdf
+*.vc.db
+*.vc.opendb
+*.ncb
+
+# Solution user options
 *.suo
 *.user
 

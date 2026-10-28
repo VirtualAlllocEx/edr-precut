@@ -281,18 +281,18 @@ static void stub_entry(PVOID dll_base)
     /* mov eax, 1 ; ret -- DllMain contract: nonzero means "load OK" */
     static const BYTE stub[6] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
 
-    if (!base) return;                                  /* null module     */
+    if (!base) return;                                /* null module        */
     dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;    /* "MZ" check      */
-    nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);    /* hop to PE hdr   */
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;    /* "PE\0\0" check  */
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;  /* "MZ" check        */
+    nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);  /* hop to PE hdr     */
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;  /* "PE\0\0" check    */
 
     ep_rva = nt->OptionalHeader.AddressOfEntryPoint;
     /* Reject a missing entry or one whose 6 bytes would run past the
      * end of the mapped image */
     if (!ep_rva || (SIZE_T)ep_rva + 6 > nt->OptionalHeader.SizeOfImage)
         return;
-    ep = base + ep_rva;                     /* RVA -> absolute address     */
+    ep = base + ep_rva;                       /* RVA -> absolute address   */
 
     /* Idempotency: if the stub is already there, do nothing. Prevents
      * double-writing and makes repeat notifications a safe no-op. */
@@ -304,7 +304,7 @@ static void stub_entry(PVOID dll_base)
      * make them writable. On failure, give up silently. */
     if (!VirtualProtect(ep, sizeof(stub), PAGE_EXECUTE_READWRITE, &old))
         return;
-    CopyMemory(ep, stub, sizeof(stub));     /* the actual 6-byte write     */
+    CopyMemory(ep, stub, sizeof(stub));       /* the actual 6-byte write   */
     VirtualProtect(ep, sizeof(stub), old, &old);  /* restore original prot */
 }
 
