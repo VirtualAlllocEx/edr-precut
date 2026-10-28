@@ -21,11 +21,6 @@ Release/
 *.vc.opendb
 *.ncb
 
-# Shellcode build artifacts
-shellcode/*.obj
-shellcode/*.exe
-shellcode/*.bin
-
 # Solution user options
 *.suo
 *.user
