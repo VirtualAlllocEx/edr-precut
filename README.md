@@ -4,33 +4,28 @@
 
 [![Platform](https://img.shields.io/badge/Platform-Windows%20x64-blue.svg)](#build-requirements) [![Language](https://img.shields.io/badge/Language-C-brightgreen.svg)](precut.c) [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Toolchain](https://img.shields.io/badge/Toolchain-MSVC%20v143-555555.svg)](#build-requirements) [![Type](https://img.shields.io/badge/Type-Security%20Research-red.svg)](#scope-and-limitations)
 
-A proof-of-concept demonstrating how to prevent EDR user-mode hooking DLLs from initializing by exploiting a timing window in the Windows PE loader — TLS callbacks execute before `NtTestAlert` drains the kernel-queued APCs that deliver the hooking engine into the process. Precut registers a DLL load notification from within that window and overwrites each target's entry point with a six-byte stub before `DllMain` ever runs.
+A proof-of-concept that prevents EDR user-mode hooking DLLs from initializing by exploiting a timing window in the Windows PE loader — TLS callbacks execute before `NtTestAlert` drains the kernel-queued APCs that deliver the hooking engine. Precut registers a DLL load notification from within that window and overwrites each target's entry point with a six-byte stub before `DllMain` ever runs.
 
-> **Complete Technical Write-Up:** For the full analysis — from kernel callback to user-mode hook installation — including the reverse engineering of how the timing window was found, why it exists, and what its boundaries are, read the blog post:
-> [EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization)
+> **Full Write-Up:** [EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization)
 
 ## :warning: Disclaimer
 
-**This project is for educational and security research purposes only.**
-
-This code demonstrates security concepts and should only be used in controlled environments for learning, testing, or legitimate security research. The author does not condone malicious use and accepts no responsibility for misuse of this code. Use at your own risk and only on systems you own or have explicit permission to test.
+**Educational and security research purposes only.** Use in controlled environments on systems you own or have explicit permission to test. The author accepts no responsibility for misuse.
 
 ---
 
 ## Codex
 
-This repository ships two files. Each one is the complete technique — they differ in how you consume it.
-
 | File | What it is | When to use it |
 |---|---|---|
-| **`precut.c`** | Self-contained proof-of-concept. All logic inline, heavily commented, builds via `PrecutCore.sln`. | You are reading the blog post, studying the technique, or running it standalone on a lab VM. |
-| **`precut.h`** | Single-header library. Same mechanism, packaged as a reusable API behind `#define PRECUT_IMPLEMENTATION`. | You are integrating Precut into an existing loader, implant, or toolchain. |
+| **`precut.c`** | Standalone PoC. All logic inline, builds via `PrecutCore.sln`. | Studying the technique or running it standalone on a lab VM. |
+| **`precut.h`** | Single-header library (`#define PRECUT_IMPLEMENTATION`). | Integrating into an existing loader or toolchain. |
 
-`precut.c` is the reference implementation — the code the blog walks through line by line. It compiles into its own binary and does everything itself: TLS registration, PEB walk, notification callback, entry-point write, return from `main`. No external dependencies, no API to learn.
+`precut.c` is the reference — the code the blog walks through. Compiles into its own binary, no external dependencies.
 
-`precut.h` is what you `#include` when you already have a project. It exposes `precut_arm()` / `precut_disarm()`, a compile-time target macro system, a stub callback, and an atomic counter — the pieces a loader needs to integrate the technique without copy-pasting internals.
+`precut.h` is what you `#include`. Exposes `precut_arm()` / `precut_disarm()`, compile-time target macros, a stub callback, and an atomic counter.
 
-There is no `examples/` folder. `precut.c` is the example. Integration snippets for `precut.h` are below.
+No `examples/` folder. `precut.c` is the example. Integration snippets for `precut.h` are below.
 
 ---
 
@@ -43,52 +38,50 @@ CreateProcessW
    ├─ EXE TLS callbacks              ◄── Precut runs here
    ├─ NtTestAlert                    ◄── EDR's APC drains here
    │    └─ EDR DLLs mapped
-   │         └─ LdrpSendDllNotifications  ◄── Precut's observer fires here
-   │              └─ LdrpCallInitRoutine   (DllMain — but Precut already stubbed the entry)
+   │         └─ LdrpSendDllNotifications  ◄── Precut's observer fires
+   │              └─ LdrpCallInitRoutine   (DllMain — already stubbed)
    ├─ PE entry (mainCRTStartup)
    └─ main
 ```
 
-When Windows creates a process, `ntdll!LdrpInitializeProcess` fires TLS callbacks early — before the CRT, before `main`, and before `NtTestAlert`. That last point matters. `NtTestAlert` drains the thread's APC queue, and EDR kernel drivers that want to inject a hooking engine typically queue that injection as an APC. Until the loader reaches `NtTestAlert`, the APC sits undelivered. The hooking DLL does not exist in the process yet.
+`NtTestAlert` drains the thread's APC queue. EDR kernel drivers queue their hooking-engine injection as an APC. Until the loader reaches `NtTestAlert`, that APC sits undelivered — the hooking DLL does not exist in the process yet.
 
-Precut lives in that window. From inside a TLS callback it does two things:
+Precut lives in that gap. From a TLS callback:
 
-**Write A** walks the PEB's `InMemoryOrderModuleList` for targets that are already mapped. On a typical APC-based EDR this finds nothing, but it covers edge cases where an image lands before TLS.
+**Write A** — PEB walk over `InMemoryOrderModuleList`. Stubs targets already mapped. Usually 0 hits (APC hasn't drained), but covers edge cases where an image lands before TLS.
 
-**Write B** registers a DLL load notification via `LdrRegisterDllNotification`. When the loader maps a new image, the notification fires *after* the image is in the address space but *before* `DllMain` runs. For each matching basename, Precut walks the PE headers to `AddressOfEntryPoint`, flips the page to `PAGE_EXECUTE_READWRITE`, and writes:
+**Write B** — Registers `LdrRegisterDllNotification`. When the loader maps a new image, the notification fires *after* the image is in memory but *before* `DllMain`. For each matching basename, Precut overwrites `AddressOfEntryPoint`:
 
 ```asm
 B8 01 00 00 00    mov eax, 1
 C3                ret
 ```
 
-The DllMain contract: return nonzero means "initialization succeeded." The loader calls what it thinks is `DllMain` and gets the stub. No hook-installation routines execute. No `E9` jmp patches land on syscall stubs. The images stay mapped but inert.
+DllMain contract: nonzero = success. The loader calls the stub, gets TRUE, moves on. Real initialization never runs. No `E9` patches land on syscall stubs.
 
 ---
 
-## Building the PoC (precut.c)
+## Building the PoC
 
-Open `PrecutCore.sln` in Visual Studio 2022, build `Release|x64`. Or from a Developer Command Prompt:
+Open `PrecutCore.sln` in VS2022, build `Release|x64`. Or:
 
 ```
 msbuild PrecutCore.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-Confirm the TLS directory exists:
+Confirm TLS directory exists:
 
 ```
 dumpbin /tls x64\Release\PrecutCore.exe
 ```
 
-Non-zero callback address means the TLS plumbing is live. If the section is missing, verify `/INCLUDE:_tls_used` under Linker → Input → Force Symbol References.
+Non-zero callback address = TLS plumbing is live. If missing, verify `/INCLUDE:_tls_used` in Linker → Input → Force Symbol References.
 
 ---
 
 ## Integrating the Library (precut.h)
 
-### Minimal standalone binary
-
-The shortest path — equivalent to what `precut.c` does, but built from the header:
+### Standalone binary
 
 ```c
 #define PRECUT_IMPLEMENTATION
@@ -109,11 +102,9 @@ int main(void)
 }
 ```
 
-`PRECUT_TLS_AUTO` emits the `.CRT$XLB` plumbing so `precut_arm()` fires at process attach. The sentinel touch keeps the TLS directory alive. `precut_disarm()` unregisters the notification after it has done its work.
+`PRECUT_TLS_AUTO` emits `.CRT$XLB` plumbing so `precut_arm()` fires at process attach.
 
 ### Loader with its own TLS callback
-
-When your loader already owns the TLS slot, skip `PRECUT_TLS_AUTO` and call `precut_arm()` yourself:
 
 ```c
 #define PRECUT_IMPLEMENTATION
@@ -126,8 +117,6 @@ When your loader already owns the TLS slot, skip `PRECUT_TLS_AUTO` and call `pre
 
 static void on_stub(const wchar_t *name, void *base, int ok)
 {
-    /* Log, count, or gate on this — runs inside TLS, no CRT available.
-     * Use WriteFile(GetStdHandle(...)) if you need output here. */
     (void)name; (void)base; (void)ok;
 }
 
@@ -150,7 +139,7 @@ int main(void)
     (void)g_tls_keep;
 
     if (precut_stub_count() > 0) {
-        /* EDR hooks neutralized — safe to run payload */
+        /* EDR hooks neutralized */
     }
 
     precut_disarm();
@@ -169,97 +158,92 @@ int main(void)
 
 | Function | Description |
 |---|---|
-| `precut_arm()` | PEB walk (Write A) + register notification (Write B). Call before `NtTestAlert`. |
-| `precut_disarm()` | Unregister the notification. Reduces forensic surface. |
-| `precut_set_callback(fn)` | `void fn(const wchar_t *name, void *base, int ok)` — fires after each stub attempt. |
-| `precut_stub_count()` | Entry points stubbed so far. Zero means nothing matched. |
+| `precut_arm()` | PEB walk (Write A) + register notification (Write B). |
+| `precut_disarm()` | Unregister notification. Reduces forensic surface. |
+| `precut_set_callback(fn)` | `void fn(const wchar_t *name, void *base, int ok)` |
+| `precut_stub_count()` | Entry points stubbed so far. |
 
 ### Compile-time options
 
 | Define | Effect |
 |---|---|
 | `PRECUT_IMPLEMENTATION` | Include the implementation. Exactly one translation unit. |
-| `PRECUT_TLS_AUTO` | Auto-register a TLS callback that calls `precut_arm()`. Implies `PRECUT_STATIC`. |
+| `PRECUT_TLS_AUTO` | Auto-register TLS callback that calls `precut_arm()`. Implies `PRECUT_STATIC`. |
 | `PRECUT_STATIC` | All API functions `static`. |
 
 ---
 
 ## Configuring Target DLLs
 
-Every target in this repository is a non-functional placeholder — `edr_hook`, `edr_dev`, `edrclient64.dll`, `edrclient.dll`. They match nothing on a live system. Before building for a lab environment, replace them with the actual basenames of the hooking DLLs injected by your target EDR. The blog post covers how to identify the correct names using a kernel debugger, `lm` output, and breakpoints on `ntdll!LdrLoadDll`.
+All targets in this repo are non-functional placeholders (`edr_hook`, `edr_dev`, `edrclient64.dll`, `edrclient.dll`). Replace with real basenames before building. Use `lm` in WinDbg or break on `ntdll!LdrLoadDll` to identify injected modules.
 
-### PREFIX vs EXACT — when to use which
+### PREFIX vs EXACT
 
-EDR vendors name their injected DLLs in one of two patterns:
-
-**Versioned names** — the basename includes a build number, hash, or version string that changes with each agent update. Only the leading portion stays constant across versions. Use `PRECUT_PREFIX` and give it just the stable part:
+**`PRECUT_PREFIX`** — for versioned DLLs where the suffix (build number, hash) changes per agent update. Give only the stable leading part:
 
 ```c
-/* Matches hookengine.dll, hookengine8542.dll, hookengine_v3.dll, etc. */
-PRECUT_PREFIX(L"hookengine")
+PRECUT_PREFIX(L"hookengine")   /* hookengine.dll, hookengine8542.dll, ... */
 ```
 
-**Fixed names** — the full filename never changes across versions. Use `PRECUT_EXACT` with the complete basename:
+**`PRECUT_EXACT`** — for fixed-name DLLs that never change across versions:
 
 ```c
-/* Matches only agentclient64.dll, nothing else */
-PRECUT_EXACT(L"agentclient64.dll")
+PRECUT_EXACT(L"agentclient64.dll")   /* only this exact filename */
 ```
 
-Can you always use `PRECUT_PREFIX` instead of `PRECUT_EXACT`? Technically yes — `PRECUT_PREFIX(L"agentclient64")` will match `agentclient64.dll`. But it would also match `agentclient64patch.dll` or `agentclient64v2.dll` if those ever appeared. Stubbing the wrong module can crash the process. `PRECUT_EXACT` rules out that ambiguity.
+### Picking the wrong one
 
-Rule of thumb: if the DLL name has a changing suffix (build numbers, hashes), use `PRECUT_PREFIX` with the stable leading part. If the name is always identical, use `PRECUT_EXACT`. When in doubt, `PRECUT_PREFIX` with a specific-enough prefix works for most cases — generic prefixes like `agent` or `hook` risk collateral matches; vendor-specific prefixes rarely collide with anything else.
+| Mistake | What happens |
+|---|---|
+| `EXACT` on a versioned DLL | Works until the agent updates and the suffix changes. Then silently stops matching — no crash, but EDR hooks load normally. |
+| `PREFIX` on a fixed-name DLL | Works fine. Only risk: a generic prefix (e.g. `agent`) could collide with unrelated modules. Stubbing the wrong module crashes the process. |
 
-### Putting it together
+`PREFIX` is the safer default for vendor-specific names. Use `EXACT` when the prefix is too generic to be collision-free. Add or remove entries freely — no fixed count.
 
-A single-vendor target list might look like this:
+### Example target lists
 
 ```c
+/* Single-vendor, versioned DLLs */
 #define PRECUT_TARGETS                          \
     PRECUT_PREFIX(L"edr_hook")                 \
     PRECUT_PREFIX(L"edr_dev")
-```
 
-A multi-vendor list combining both match types:
-
-```c
+/* Multi-vendor, mixed strategies */
 #define PRECUT_TARGETS                          \
     PRECUT_PREFIX(L"vendorA_hook")             \
     PRECUT_PREFIX(L"vendorA_dev")              \
     PRECUT_EXACT(L"vendorBclient64.dll")
 ```
 
-Add one line per DLL the EDR injects. Remove lines you don't need. There is no fixed number of entries — match what you see in `lm` output on your lab VM.
-
 ---
 
 ## Build Requirements
 
-MSVC only. The TLS callback registration depends on four pieces of MSVC-specific machinery:
+MSVC only. Four pieces of MSVC-specific machinery:
 
-1. **`#pragma section(".CRT$XLB", long, read)`** — places the callback pointer into the CRT's TLS array. The linker merges `.CRT$XLA` through `.CRT$XLZ` alphabetically. MinGW does not guarantee the same merge behavior.
-2. **`__declspec(allocate(".CRT$XLB"))`** — pins the pointer to that section. No GCC equivalent.
-3. **`__declspec(thread)`** — keeps the TLS directory alive. Without it, the linker may optimize away the entire apparatus.
+1. **`#pragma section(".CRT$XLB", long, read)`** — callback pointer into the CRT TLS array. MinGW does not guarantee the same section merge.
+2. **`__declspec(allocate(".CRT$XLB"))`** — pins the pointer. No GCC equivalent.
+3. **`__declspec(thread)`** — keeps the TLS directory alive.
 4. **`/INCLUDE:_tls_used`** — forces emission of `IMAGE_TLS_DIRECTORY64`.
 
-Visual Studio 2022, v143 toolset, x64. The project uses `/MT` (static CRT).
+VS2022, v143 toolset, x64, `/MT` (static CRT).
 
 ---
 
 ## Verification
 
-Run the binary on a lab VM with the target EDR active. Attach WinDbg before launch.
+Run on a lab VM with the target EDR active. Attach WinDbg before launch.
 
-**1. Confirm TLS ran before the APC:**
+**1. Confirm TLS ran before APC:**
 
 ```
 bp ntdll!NtTestAlert
 g
 ```
 
-At the breakpoint, the notification is already registered but the EDR DLLs have not been mapped.
+At the break, the notification is registered but EDR DLLs are not yet mapped.
 
-**2. Continue, inspect the targets:**
+**2. Continue and inspect targets:**
 
 ```
 g
@@ -274,31 +258,29 @@ Replace `edr_*` with your target pattern. Modules appear mapped but entry points
 db ntdll!NtProtectVirtualMemory L6
 ```
 
-Clean: `4C 8B D1 B8 xx xx` (`mov r10, rcx` / `mov eax, <syscall_number>`). If byte `+3` is `E9`, the hooks landed — wrong target list or the product injects before TLS.
+Clean: `4C 8B D1 B8 xx xx`. If byte +3 is `E9`, hooks landed — wrong target list or the product injects before TLS.
 
 ---
 
 ## Scope and Limitations
 
-Precut targets one initialization order: EDR products that deliver their user-mode engine via a kernel APC draining at `NtTestAlert`, after EXE TLS callbacks have executed. Common pattern, not the only one.
+Precut targets one initialization order: EDR products that deliver their user-mode engine via a kernel APC draining at `NtTestAlert`, after EXE TLS. Common pattern, not the only one.
 
-Products that map their hooking DLL synchronously from a kernel image-load callback will have the module present before TLS runs. Write A partially covers this, but if the EDR's `DllMain` also completes synchronously, the hooks are installed before Precut acts. The blog post discusses this in detail.
+Products that map synchronously from a kernel image-load callback will have the module present before TLS runs. Write A partially covers this, but if `DllMain` also completes synchronously, hooks are installed before Precut acts. The blog post discusses this boundary.
 
-The undocumented loader structures and notification API have been stable across Windows 10 and 11 (tested through 10.0.26100). Windows 7/8 expose `LdrRegisterDllNotification` but have not been verified.
-
-x64 only. PEB via `gs:[0x60]`, 64-bit optional header layout, x64 stub encoding.
+Loader structures and the notification API have been stable across Win10/11 (tested through 10.0.26100). Win7/8 expose `LdrRegisterDllNotification` but are unverified. x64 only.
 
 ---
 
-## References and Further Reading
+## References
 
-- Microsoft, [PE Format — The TLS Section](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-tls-section). TLS directory fields and callback conventions.
-- Microsoft, [CRT initialization](https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-initialization). Runtime initialization and the distinction between the executable entry point and application code.
-- Microsoft, [DllMain entry point](https://learn.microsoft.com/en-us/windows/win32/dlls/dllmain) and [Dynamic-Link Library Best Practices](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-best-practices). DLL initialization constraints and attachment return semantics.
-- Galen Hunt and Doug Brubacher, [Detours: Binary Interception of Win32 Functions](https://www.microsoft.com/en-us/research/publication/detours-binary-interception-of-win32-functions/), 1999. General binary-interception background.
-- MDSec, [Bypassing User-Mode Hooks and Direct Invocation of System Calls for Red Teams](https://www.mdsec.co.uk/2020/12/bypassing-user-mode-hooks-and-direct-invocation-of-system-calls-for-red-teams/), December 2020. Invocation-path and hook context.
-- Marcus Hutchins, [Bypassing EDRs With EDR-Preloading](https://malwaretech.com/2024/02/bypassing-edrs-with-edr-preload.html), 13 February 2024. Prior startup-oriented research.
-- Guido Miggelenbrink, [Introducing Early Cascade Injection: From Windows Process Creation to Stealthy Injection](https://www.outflank.nl/blog/2024/10/15/introducing-early-cascade-injection-from-windows-process-creation-to-stealthy-injection/), 15 October 2024. Additional process-initialization context.
+- Microsoft, [PE Format — The TLS Section](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-tls-section). TLS directory and callback conventions.
+- Microsoft, [CRT initialization](https://learn.microsoft.com/en-us/cpp/c-runtime-library/crt-initialization). Runtime init vs application entry.
+- Microsoft, [DllMain entry point](https://learn.microsoft.com/en-us/windows/win32/dlls/dllmain) and [DLL Best Practices](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-best-practices). Attachment semantics.
+- Hunt & Brubacher, [Detours: Binary Interception of Win32 Functions](https://www.microsoft.com/en-us/research/publication/detours-binary-interception-of-win32-functions/), 1999.
+- MDSec, [Bypassing User-Mode Hooks and Direct Invocation of System Calls](https://www.mdsec.co.uk/2020/12/bypassing-user-mode-hooks-and-direct-invocation-of-system-calls-for-red-teams/), 2020.
+- Marcus Hutchins, [Bypassing EDRs With EDR-Preloading](https://malwaretech.com/2024/02/bypassing-edrs-with-edr-preload.html), 2024.
+- Guido Miggelenbrink, [Early Cascade Injection](https://www.outflank.nl/blog/2024/10/15/introducing-early-cascade-injection-from-windows-process-creation-to-stealthy-injection/), 2024.
 
 ---
 
