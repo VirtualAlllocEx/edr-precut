@@ -8,7 +8,7 @@ A proof-of-concept that prevents EDR user-mode hooking DLLs from initializing by
 
 > **Full Write-Up:** [EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization)
 
-## :warning: Disclaimer
+## Disclaimer
 
 **Educational and security research purposes only.** Use in controlled environments on systems you own or have explicit permission to test. The author accepts no responsibility for misuse.
 
