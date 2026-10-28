@@ -1,8 +1,19 @@
 # Precut
 
-Stub EDR user-mode hooking DLLs before they initialize — from inside the PE loader's own TLS window.
+---
 
-Companion code for [EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization).
+[![Platform](https://img.shields.io/badge/Platform-Windows%20x64-blue.svg)](#build-requirements) [![Language](https://img.shields.io/badge/Language-C-brightgreen.svg)](precut.c) [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Toolchain](https://img.shields.io/badge/Toolchain-MSVC%20v143-555555.svg)](#build-requirements) [![Type](https://img.shields.io/badge/Type-Security%20Research-red.svg)](#scope-and-limitations)
+
+A proof-of-concept demonstrating how to prevent EDR user-mode hooking DLLs from initializing by exploiting a timing window in the Windows PE loader — TLS callbacks execute before `NtTestAlert` drains the kernel-queued APCs that deliver the hooking engine into the process. Precut registers a DLL load notification from within that window and overwrites each target's entry point with a six-byte stub before `DllMain` ever runs.
+
+> **Complete Technical Write-Up:** For the full analysis — from kernel callback to user-mode hook installation — including the reverse engineering of how the timing window was found, why it exists, and what its boundaries are, read the blog post:
+> [EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization)
+
+## :warning: Disclaimer
+
+**This project is for educational and security research purposes only.**
+
+This code demonstrates security concepts and should only be used in controlled environments for learning, testing, or legitimate security research. The author does not condone malicious use and accepts no responsibility for misuse of this code. Use at your own risk and only on systems you own or have explicit permission to test.
 
 ---
 
@@ -235,10 +246,6 @@ The undocumented loader structures and notification API have been stable across 
 x64 only. PEB via `gs:[0x60]`, 64-bit optional header layout, x64 stub encoding.
 
 ---
-
-## Disclaimer
-
-Published for educational purposes and authorized security research only. Do not use against systems you do not own or do not have explicit written permission to test. The author assumes no liability for misuse.
 
 ## Author
 
