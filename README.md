@@ -102,7 +102,7 @@ cd shellcode
 build.bat
 ```
 
-The script compiles with MSVC, extracts the `.text` section via `dumpbin`, and optionally emits a C byte array you can paste into a loader. The resulting shellcode is a function with no arguments — call it from a TLS slot, a loader's early init, or any context that executes before `NtTestAlert` drains the APC queue. The caller is responsible for arranging that early execution; the shellcode itself does not register a TLS callback (it has no PE headers to declare one in).
+The script compiles with MSVC, links a minimal PE, and extracts the raw `.text` section to a `.bin` file via PowerShell PE header parsing. The resulting shellcode is a function with no arguments — call it from a TLS slot, a loader's early init, or any context that executes before `NtTestAlert` drains the APC queue. The caller is responsible for arranging that early execution; the shellcode itself does not register a TLS callback (it has no PE headers to declare one in).
 
 Target DLL names are compiled into the shellcode as stack strings. Edit them in `precut_pic.c` before building.
 
@@ -121,7 +121,7 @@ The standalone PoC and the header library must be compiled with MSVC. The TLS ca
 
 A MinGW `.CRT$XLB` section without the corresponding TLS directory is not equivalent — the callback pointer exists in the binary but the loader never sees it.
 
-The shellcode variant has its own `build.bat` and needs only a VS2022 Developer Command Prompt (the `cl` and `dumpbin` tools). It does not use TLS plumbing itself since the caller provides early execution.
+The shellcode variant has its own `build.bat` and needs a VS2022 Developer Command Prompt (`cl.exe` and `link.exe`) with PowerShell available for the `.text` extraction step. It does not use TLS plumbing itself since the caller provides early execution.
 
 ## Verification
 
