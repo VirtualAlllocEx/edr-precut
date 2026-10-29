@@ -6,7 +6,7 @@
 
 A proof-of-concept that prevents EDR user-mode hooking DLLs from initializing by exploiting a timing window in the Windows PE loader — TLS callbacks execute before `NtTestAlert` drains the kernel-queued APCs that deliver the hooking engine. Precut registers a DLL load notification from within that window and overwrites each target's entry point with a six-byte stub before `DllMain` ever runs.
 
-> **Full Write-Up:** [EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization)
+> **Full Write-Up:** [EDR Analysis: TLS Callbacks and User-Mode Hook Initialization](https://redops.at/en/blog/edr-analysis-tls-callbacks-and-user-mode-hook-initialization-public-version)
 
 ## Disclaimer
 
